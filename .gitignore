@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+train_classifier_interactive.py
+batch_segment_and_classify.py
+logs
+run_batch.sbatch
+
