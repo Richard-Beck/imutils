@@ -1,5 +1,6 @@
 import os
 import pickle
+import time
 import numpy as np
 import torch
 import cv2
@@ -8,11 +9,6 @@ from sklearn.ensemble import RandomForestClassifier
 from scipy.ndimage import find_objects
 
 class ObjectClassifier:
-    """
-    Handles feature extraction and classification using RandomForestClassifier.
-    - Uses a combined feature vector from a tight crop and a surrounding context crop.
-    """
-    # Version number for the feature format. Increment if features change.
     FEATURE_VERSION = 2
 
     def __init__(self, crop_size=224):
@@ -36,27 +32,30 @@ class ObjectClassifier:
 
     def _get_combined_features(self, image, masks, object_ids):
         """Helper to extract, process, and combine features from both crops."""
-        tight_crops, context_crops = self._extract_crops_and_preprocess(image, masks, object_ids)
+        # Added verbose=True to see progress on large images
+        tight_crops, context_crops = self._extract_crops_and_preprocess(image, masks, object_ids, verbose=True)
         if not tight_crops:
             return None
 
         # Get embeddings for both crop types
+        # This part runs on GPU and should be fast
         tight_embeddings = self._get_embeddings(torch.stack(tight_crops).to(self.device))
         context_embeddings = self._get_embeddings(torch.stack(context_crops).to(self.device))
         
-        # Concatenate the two embeddings into one feature vector
         combined_features = np.concatenate([tight_embeddings, context_embeddings], axis=1)
         return combined_features
 
     def train_and_predict(self, all_images, all_masks, all_labels, predict_image, predict_masks) -> dict:
-        """Trains on all labeled data and predicts on the current image."""
+        print("\n--- Starting Training Loop ---")
         print("Gathering training data from all images...")
         all_train_features, all_train_labels = [], []
         
+        start_time = time.time()
         for i, (img, msk, lab) in enumerate(zip(all_images, all_masks, all_labels)):
             object_ids = [oid for oid, label_id in lab.items() if label_id != 0]
             if not object_ids: continue
             
+            # Don't need verbose for training data gathering (usually sparse)
             features = self._get_combined_features(img, msk, object_ids)
             if features is not None:
                 all_train_features.append(features)
@@ -73,27 +72,29 @@ class ObjectClassifier:
             print("⚠️ Insufficient data for training (less than 2 classes or samples).")
             return {}
         
-        print(f"Training on {len(y_train)} annotations...")
+        print(f"Training on {len(y_train)} annotations... (took {time.time() - start_time:.2f}s to gather)")
         self.classifier.fit(X_train, y_train)
         self.is_trained = True
+        print("✅ Training complete.")
 
+        print("--- Starting Prediction on Current Image ---")
         return self.predict_only(predict_image, predict_masks)
 
     def predict_only(self, image: np.ndarray, masks: np.ndarray) -> dict:
-        """Predicts labels for a single image, for use with the interactive editor."""
         if not self.is_trained: return {}
         
         all_ids_current = sorted([i for i in np.unique(masks) if i != 0])
         if not all_ids_current: return {}
         
+        print(f"Predicting for {len(all_ids_current)} objects in current view...")
         X_predict = self._get_combined_features(image, masks, all_ids_current)
         if X_predict is None: return {}
         
         predictions = self.classifier.predict(X_predict)
+        print("✅ Prediction complete.")
         return {int(obj_id): int(pred) for obj_id, pred in zip(all_ids_current, predictions)}
 
     def predict_with_probabilities(self, image: np.ndarray, masks: np.ndarray) -> dict:
-        """Predicts labels and class probabilities, designed for batch processing."""
         if not self.is_trained: return {}
 
         all_ids_current = sorted([i for i in np.unique(masks) if i != 0])
@@ -110,14 +111,22 @@ class ObjectClassifier:
             for obj_id, pred, probs in zip(all_ids_current, predictions, probabilities)
         }
 
-    def _extract_crops_and_preprocess(self, image: np.ndarray, masks: np.ndarray, object_ids: list) -> tuple:
-        """Extracts a tight crop and an expanded context crop for each object."""
+    def _extract_crops_and_preprocess(self, image: np.ndarray, masks: np.ndarray, object_ids: list, verbose=False) -> tuple:
         tight_crop_tensors = []
         context_crop_tensors = []
         h, w, _ = image.shape
         locations = find_objects(masks)
+        
+        total = len(object_ids)
+        # Log progress if we have a lot of objects to process
+        should_log = verbose and total > 100 
 
-        for obj_id in object_ids:
+        if should_log: print(f"  Extracting crops for {total} objects...")
+
+        for idx, obj_id in enumerate(object_ids):
+            if idx % 200 == 0 and should_log and idx > 0:
+                 print(f"    ...processed {idx}/{total} ({idx/total*100:.0f}%)")
+
             if obj_id == 0 or obj_id > len(locations) or locations[obj_id - 1] is None: continue
             
             y_slice, x_slice = locations[obj_id - 1]
@@ -126,6 +135,9 @@ class ObjectClassifier:
             img_crop_tight = image[y_slice, x_slice]
             mask_crop = (masks[y_slice, x_slice] == obj_id).astype(np.uint8)
             masked_img_crop = img_crop_tight * np.stack([mask_crop] * 3, axis=-1)
+            
+            # STRICT FLOAT32 CASTING
+            masked_img_crop = masked_img_crop.astype(np.float32)
             tight_crop_tensors.append(self.transform(masked_img_crop))
 
             # 2. Expanded context crop (unmasked)
@@ -138,6 +150,9 @@ class ObjectClassifier:
             x_end = min(w, cx + (bw * 3) // 2)
             
             img_crop_context = image[y_start:y_end, x_start:x_end]
+            
+            # STRICT FLOAT32 CASTING
+            img_crop_context = img_crop_context.astype(np.float32)
             context_crop_tensors.append(self.transform(img_crop_context))
 
         if not tight_crop_tensors:
@@ -151,7 +166,6 @@ class ObjectClassifier:
         return self.backbone(preprocessed_crops).cpu().numpy()
 
     def save_state(self, path: str):
-        """Saves the classifier state and feature version."""
         state = {
             'classifier': self.classifier,
             'is_trained': self.is_trained,
@@ -162,12 +176,11 @@ class ObjectClassifier:
         print(f"✅ Classifier state saved to {path}")
 
     def load_state(self, path: str):
-        """Loads classifier state, checking for feature format compatibility."""
         print(f"✅ Loading classifier state from {path}")
         with open(path, 'rb') as f:
             state = pickle.load(f)
         
-        loaded_version = state.get('feature_version', 1) # Default to 1 if no version is saved
+        loaded_version = state.get('feature_version', 1) 
         
         if loaded_version == self.FEATURE_VERSION and isinstance(state.get('classifier'), RandomForestClassifier):
             self.classifier = state['classifier']
